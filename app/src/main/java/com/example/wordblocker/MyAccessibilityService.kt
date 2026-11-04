@@ -5,6 +5,7 @@ import android.content.Context
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlin.math.min
+import com.google.mlkit.nl.languageid.LanguageIdentification
 
 class MyAccessibilityService : AccessibilityService() {
     // Список запрещенных слов и фраз
@@ -26,31 +27,39 @@ class MyAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString() ?: return
 
-        // 1. Всегда проверяем защиту настроек при любых изменениях окон
+        // Всегда проверяем защиту настроек при любых изменениях окон
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             checkNodeInfoOfWordBlocker(packageName, event)
         }
 
-        // 2. Проверяем, разрешен ли пакет (браузер или поиск Google)
+        // Проверяем, разрешен ли пакет (браузер или поиск Google)
         if (!allowedBrowsers.contains(packageName)) {
             return
         }
 
-        // 3. Логика обработки ввода в зависимости от типа события
+        // Логика обработки ввода в зависимости от типа события
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
                 val node = event.source
                 if (node != null && node.isEditable) {
                     val text = node.text?.toString() ?: ""
-                    if (text.isNotBlank() && containsForbiddenWord(text)) {
-                        blockBadSite(node) // Меняем blockUser на blockBadSite
-                        return
+                    if (text.isNotBlank()) {
+                        // Проверяем на запрещенные слова
+                        if (containsForbiddenWord(text)) {
+                            blockBadSite(node)
+                            return
+                        }
+                        // Проверяем язык через ML Kit
+                        isAllowedLanguage(text) { isAllowed ->
+                            if (!isAllowed) {
+                                blockBadSite(node)
+                            }
+                        }
                     }
                 }
 
-                // Убираем жесткую привязку к Chrome, проверяем для любого разрешенного браузера
                 val root = rootInActiveWindow
                 if (root != null && checkChromeInputFields(root)) {
                     return
@@ -67,6 +76,32 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun isAllowedLanguage(text: String, onResult: (Boolean) -> Unit) {
+        if (text.length < 3) {
+            onResult(true) // Слишком короткий текст (1-2 буквы) пропускаем
+            return
+        }
+
+        val languageIdentifier = LanguageIdentification.getClient()
+        languageIdentifier.identifyLanguage(text)
+            .addOnSuccessListener { languageCode ->
+                if (languageCode == "und") {
+                    onResult(true) // Если язык не удалось распознать, на всякий случай не блокируем
+                    return@addOnSuccessListener
+                }
+
+                // Список строго разрешенных языков
+                val allowedLanguages = setOf("en", "ru", "tr")
+
+                // Если язык НЕ входит в разрешенные (например, "es" - испанский, "zh" - китайский), то блокируем
+                val isAllowed = allowedLanguages.contains(languageCode)
+                onResult(isAllowed)
+            }
+            .addOnFailureListener {
+                onResult(true) // При ошибке не блокируем
+            }
+    }
+
     // Безопасный обход дерева Chrome: ищет только видимые поля ввода (адресная строка и формы поиска)
     private fun checkChromeInputFields(
         node: AccessibilityNodeInfo?,
@@ -74,21 +109,27 @@ class MyAccessibilityService : AccessibilityService() {
     ): Boolean {
         if (node == null || depth > 15) return false
 
-        // Проверяем только видимые элементы, которые можно редактировать или которые являются полями ввода
         if (node.isVisibleToUser && (node.isEditable || node.className?.toString()?.contains("EditText") == true)) {
             val text = node.text?.toString() ?: ""
 
-            // Проверяем запрещенные слова строго в введенном тексте
-            if (text.isNotBlank() && containsForbiddenWord(text)) {
-                blockBadSite(node)
-                return true
+            if (text.isNotBlank()) {
+                if (containsForbiddenWord(text)) {
+                    blockBadSite(node)
+                    return true
+                }
+
+                // Проверка языка в рекурсивном обходе
+                isAllowedLanguage(text) { isAllowed ->
+                    if (!isAllowed) {
+                        blockBadSite(node)
+                    }
+                }
             }
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             val found = checkChromeInputFields(child, depth + 1)
-
             if (found) return true
         }
         return false
@@ -163,12 +204,13 @@ class MyAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Нечеткий поиск (опечатки) для длинных слов (исправлен синтаксис диапазона)
-            if (normalizedWord.length > 4 && normalizedText.length >= normalizedWord.length - 2) {
+            // Нечеткий поиск (опечатки) для длинных слов
+            if (normalizedWord.length > 4 && normalizedText.length >= normalizedWord.length) {
                 val maxErrors = if (normalizedWord.length <= 7) 1 else 2
                 val windowSize = normalizedWord.length
 
-                for (i in 0..(normalizedText.length - windowSize + maxErrors)) {
+                val limit = (normalizedText.length - windowSize + maxErrors).coerceAtLeast(0)
+                for (i in 0..limit) {
                     val endIndex = min(i + windowSize + maxErrors, normalizedText.length)
                     if (i >= endIndex) continue
                     val sub = normalizedText.substring(i, endIndex)
@@ -180,10 +222,6 @@ class MyAccessibilityService : AccessibilityService() {
             }
         }
         return false
-    }
-
-    private fun blockUser() {
-        performGlobalAction(GLOBAL_ACTION_HOME)
     }
 
     // Функция для программной очистки текста в поле ввода

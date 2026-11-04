@@ -12,7 +12,7 @@ import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
     // Вынесли пароль на уровень класса, ALERT: пароль для деактиваций приложение
-    private val ADMIN_PASSWORD = "#@#IFwj4oifjsij4342#42#$$#@#iofj4ijig4owi"
+    private val ADMIN_PASSWORD = "your_admin_password"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
