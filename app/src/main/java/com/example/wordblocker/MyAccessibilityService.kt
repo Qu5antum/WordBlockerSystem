@@ -6,6 +6,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlin.math.min
 import com.google.mlkit.nl.languageid.LanguageIdentification
+import java.util.Locale
 
 class MyAccessibilityService : AccessibilityService() {
     // Список запрещенных слов и фраз
@@ -77,31 +78,53 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     private fun isAllowedLanguage(text: String, onResult: (Boolean) -> Unit) {
-        if (text.length < 3) {
-            onResult(true) // Слишком короткий текст (1-2 буквы) пропускаем
+        // Оставляем только буквы
+        val lettersOnly = text.filter { it.isLetter() }
+
+        // Если введены только цифры, короткие слова или строка короче 5 букв — НЕ блокируем (избегаем ложных срабатываний на коротких словах)
+        if (lettersOnly.isEmpty() || lettersOnly.length < 5) {
+            onResult(true)
             return
         }
 
         val languageIdentifier = LanguageIdentification.getClient()
-        languageIdentifier.identifyLanguage(text)
-            .addOnSuccessListener { languageCode ->
-                if (languageCode == "und") {
-                    onResult(true) // Если язык не удалось распознать, на всякий случай не блокируем
+
+        // Используем identifyPossibleLanguages вместо identifyLanguage, чтобы видеть уверенность и список вариантов
+        languageIdentifier.identifyPossibleLanguages(lettersOnly)
+            .addOnSuccessListener { languages ->
+                if (languages.isEmpty()) {
+                    onResult(true)
+                    return@addOnSuccessListener
+                }
+
+                // Находим наиболее вероятный язык
+                val bestMatch = languages.maxByOrNull { it.confidence }
+                if (bestMatch == null) {
+                    onResult(true)
+                    return@addOnSuccessListener
+                }
+
+                val languageCode = bestMatch.languageTag
+                val confidence = bestMatch.confidence
+
+                // Если язык не определен ("und") или уверенность слишком низкая (< 60%),
+                // мы НЕ блокируем пользователя, чтобы не было ложных срабатываний при быстрой печати
+                if (languageCode == "und" || confidence < 0.6f) {
+                    onResult(true)
                     return@addOnSuccessListener
                 }
 
                 // Список строго разрешенных языков
                 val allowedLanguages = setOf("en", "ru", "tr")
 
-                // Если язык НЕ входит в разрешенные (например, "es" - испанский, "zh" - китайский), то блокируем
+                // Блокируем только если алгоритм на 100% уверен, что это другой язык (например, испанский "es" или китайский "zh")
                 val isAllowed = allowedLanguages.contains(languageCode)
                 onResult(isAllowed)
             }
             .addOnFailureListener {
-                onResult(true) // При ошибке не блокируем
+                onResult(true) // При сбое сети или библиотек не блокируем пользователя
             }
     }
-
     // Безопасный обход дерева Chrome: ищет только видимые поля ввода (адресная строка и формы поиска)
     private fun checkChromeInputFields(
         node: AccessibilityNodeInfo?,
@@ -149,16 +172,11 @@ class MyAccessibilityService : AccessibilityService() {
 
     // Нормализация текста: полностью удаляем пробелы, спецсимволы и заменяем похожие знаки
     private fun normalize(text: String): String {
-        return text.lowercase()
-            .replace('0', 'o')
-            .replace('1', 'i')
-            .replace('3', 'e')
-            .replace('4', 'a')
-            .replace('5', 's')
-            .replace('7', 't')
+        return text.lowercase(Locale.ROOT)
+            .replace('ı', 'i')
             .replace('@', 'a')
             .replace('$', 's')
-            .replace(Regex("[^a-zа-яё0-9]"), "") // Удаляем все, включая пробелы и точки
+            .replace(Regex("[^\\p{L}\\p{N}]"), "")
     }
 
     // Расстояние Левенштейна для поиска опечаток
@@ -195,7 +213,7 @@ class MyAccessibilityService : AccessibilityService() {
             if (normalizedText.contains(normalizedWord)) {
                 if (normalizedWord.length <= 3) {
                     // Защита для коротких слов: проверяем, было ли это слово самостоятельным в оригинале
-                    val wordsOriginal = text.lowercase().split(Regex("[^a-zа-яё0-9]+"))
+                    val wordsOriginal = text.lowercase().split(Regex("[^\\p{L}\\p{N}]+"))
                     if (wordsOriginal.any { normalize(it) == normalizedWord }) {
                         return true
                     }
@@ -212,7 +230,7 @@ class MyAccessibilityService : AccessibilityService() {
                 val limit = (normalizedText.length - windowSize + maxErrors).coerceAtLeast(0)
                 for (i in 0..limit) {
                     val endIndex = min(i + windowSize + maxErrors, normalizedText.length)
-                    if (i >= endIndex) continue
+                    if (i >= endIndex || i < 0) continue
                     val sub = normalizedText.substring(i, endIndex)
 
                     if (levenshtein(sub, normalizedWord) <= maxErrors) {
